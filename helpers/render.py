@@ -92,6 +92,28 @@ def resolve_path(maybe_path: str, base: Path) -> Path:
     return (base / p).resolve()
 
 
+_video_duration_cache: dict[str, float] = {}
+
+
+def get_video_stream_duration(path: Path) -> float:
+    """Duration of the VIDEO stream specifically (not the container/audio duration).
+
+    Phone recordings commonly have a video stream that ends 0.15-0.4s before the
+    audio stream. Requesting an EDL range past the video's real length produces
+    unpredictable ffmpeg behavior (frozen last frame, early stop) with no error or
+    warning - silently corrupts sync for every segment after it. Always clamp
+    against this, never against the container/audio duration alone."""
+    key = str(path)
+    if key not in _video_duration_cache:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1", key],
+            capture_output=True, text=True,
+        )
+        _video_duration_cache[key] = float(out.stdout.strip())
+    return _video_duration_cache[key]
+
+
 # -------- HDR → SDR tone mapping (HLG / PQ sources) --------------------------
 #
 # iPhone defaults to HLG HDR in Rec.2020 (and many mirrorless cameras ship PQ).
@@ -132,15 +154,34 @@ def is_hdr_source(video: Path) -> bool:
 
 
 def is_portrait_source(video: Path) -> bool:
-    """Return True if the video's height > width (portrait / vertical)."""
+    """Return True if the video displays taller than wide (portrait / vertical).
+
+    Checks raw width/height AND any 90/270 rotation side-data (Display Matrix or
+    the legacy `rotate` tag). A landscape-stored file (e.g. 1920x1080) with a
+    +/-90 degree rotation displays as portrait — treating it as landscape here
+    scales it with the wrong branch and stretches the output.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
-             "-of", "csv=p=0", str(video)],
+             "-show_entries", "stream_side_data=rotation",
+             "-show_entries", "stream_tags=rotate",
+             "-of", "json", str(video)],
             capture_output=True, text=True, check=True,
         )
-        w, h = map(int, out.stdout.strip().split(","))
+        data = json.loads(out.stdout)
+        stream = data["streams"][0]
+        w, h = stream["width"], stream["height"]
+        rotation = 0
+        for sd in stream.get("side_data_list", []):
+            if "rotation" in sd:
+                rotation = int(sd["rotation"])
+                break
+        if rotation == 0:
+            rotation = int(stream.get("tags", {}).get("rotate", 0))
+        if abs(rotation) in (90, 270):
+            w, h = h, w
         return h > w
     except Exception:
         return False
@@ -243,6 +284,12 @@ def extract_all_segments(
         src_path = resolve_path(sources[src_name], edit_dir)
         start = float(r["start"])
         end = float(r["end"])
+        video_dur = get_video_stream_duration(src_path)
+        if end > video_dur:
+            clamped_end = round(video_dur - 0.02, 3)
+            print(f"  [{i:02d}] WARNING: {src_name} end={end:.3f} exceeds video stream "
+                  f"duration {video_dur:.3f} - clamping to {clamped_end:.3f}")
+            end = clamped_end
         duration = end - start
         out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
 
