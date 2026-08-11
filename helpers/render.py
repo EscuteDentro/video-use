@@ -198,11 +198,25 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    audio_filter: str = "",
+    fade_in: float = 0.03,
+    fade_out: float = 0.03,
 ) -> None:
-    """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
+    """Extract a cut range as its own MP4 with grade + audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
+
+    `audio_filter` (from the EDL's top-level `audio_filter` field, e.g. a denoise
+    chain) is applied before the edge fades, once per segment - correct because
+    fftdn-style filters need warm-up context and per-segment application avoids
+    a discontinuity in the noise profile at concat boundaries.
+
+    `fade_in`/`fade_out` (from the EDL range's own `fade_in`/`fade_out` fields,
+    default 0.03s) let a specific cut get a longer fade than the rest - e.g. a
+    tight cut with no natural trailing silence in the source can still read as
+    a soft "breath" by fading the volume down over ~0.2-0.3s instead of the
+    default 30ms click-guard fade.
 
     Quality ladder:
       - final (default): 1080p libx264 fast CRF 20
@@ -225,9 +239,13 @@ def extract_segment(
         vf_parts.append(grade_filter)
     vf = ",".join(vf_parts)
 
-    # 30ms audio fades at both edges (Rule 3) — prevent pops
-    fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    af_parts: list[str] = []
+    if audio_filter:
+        af_parts.append(audio_filter)
+    fade_out_start = max(0.0, duration - fade_out)
+    af_parts.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    af_parts.append(f"afade=t=out:st={fade_out_start:.3f}:d={fade_out:.3f}")
+    af = ",".join(af_parts)
 
     if draft:
         preset, crf = "ultrafast", "28"
@@ -267,6 +285,7 @@ def extract_all_segments(
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
+    audio_filter = edl.get("audio_filter") or ""
     clips_dir = edit_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
@@ -302,7 +321,10 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        fade_in = float(r.get("fade_in", 0.03))
+        fade_out = float(r.get("fade_out", 0.03))
+        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft,
+                         audio_filter=audio_filter, fade_in=fade_in, fade_out=fade_out)
         seg_paths.append(out_path)
 
     return seg_paths
