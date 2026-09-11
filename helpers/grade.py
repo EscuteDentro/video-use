@@ -1,6 +1,6 @@
 """Apply a color grade to a video via ffmpeg filter chain.
 
-Two modes:
+Three modes:
 
   1. Preset mode — pick a named preset (e.g. `warm_cinematic`, `neutral_punch`).
      Simple fixed filter chain applied uniformly.
@@ -15,14 +15,25 @@ Two modes:
      creative LUTs, teal/orange splits, or filmic curves. For creative looks,
      use `--preset warm_cinematic` explicitly.
 
+  3. 3-way color balance (OPT-IN, never touches auto mode) — independent
+     shadows/midtones/highlights RGB offset, same mental model as a
+     professional NLE's lift/gamma/gain wheels. Built on ffmpeg's native
+     `colorbalance` filter (the same filter `warm_cinematic` already uses
+     internally, exposed here as free-form parameters instead of a fixed
+     look). Combine with `--sat` for an overall saturation multiplier.
+
 Usage:
     python helpers/grade.py <input> -o <output>                   # auto mode
     python helpers/grade.py <input> -o <output> --preset warm_cinematic
     python helpers/grade.py <input> -o <output> --filter 'eq=contrast=1.1'
+    python helpers/grade.py <input> -o <output> \
+        --lift 0.02,0.0,-0.03 --gamma 0.0,0.0,0.0 --gain -0.05,0.0,0.05 --sat 0.92
+                                                                    # 3-way color balance
     python helpers/grade.py --print-preset warm_cinematic         # print filter only
     python helpers/grade.py --analyze <input>                     # print auto-grade analysis
 
-Can also be imported by render.py: `get_preset(name)` and `auto_grade_for_clip(path, edl_range)`.
+Can also be imported by render.py: `get_preset(name)`, `auto_grade_for_clip(path, edl_range)`,
+and `build_three_way_filter(lift, gamma, gain, saturation)`.
 """
 
 from __future__ import annotations
@@ -271,6 +282,70 @@ def auto_grade_for_clip(
     return filter_string, stats
 
 
+# -------- 3-way color balance (opt-in, parametrized) ------------------------
+
+
+def _parse_rgb_triplet(raw: str, flag_name: str) -> tuple[float, float, float]:
+    """Parse 'r,g,b' (e.g. '0.02,0.0,-0.03') into a float triplet.
+
+    Range is the same convention as ffmpeg's `colorbalance`: roughly -1..1,
+    values above ~±0.3 look extreme. Not clamped here — ffmpeg will clamp
+    internally, and clamping silently would hide a typo (e.g. '20' instead
+    of '0.2') from the caller.
+    """
+    parts = raw.split(",")
+    if len(parts) != 3:
+        raise ValueError(f"--{flag_name} expects 'r,g,b' (got '{raw}')")
+    try:
+        r, g, b = (float(p) for p in parts)
+    except ValueError as e:
+        raise ValueError(f"--{flag_name} expects 3 numbers 'r,g,b' (got '{raw}')") from e
+    return r, g, b
+
+
+def build_three_way_filter(
+    lift: tuple[float, float, float] | None = None,
+    gamma: tuple[float, float, float] | None = None,
+    gain: tuple[float, float, float] | None = None,
+    saturation: float | None = None,
+) -> str:
+    """Build an ffmpeg filter string for independent shadows/mids/highlights
+    RGB correction — the same control surface as a color wheel-based NLE's
+    lift/gamma/gain, using ffmpeg's native `colorbalance` filter (rs/gs/bs =
+    shadows, rm/gm/bm = midtones, rh/gh/bh = highlights).
+
+    Any of the three bands may be omitted (defaults to no shift, 0.0/0.0/0.0).
+    `saturation` is an optional overall multiplier applied via `eq=`, same
+    convention as the rest of this module (1.0 = no change).
+
+    Returns "" if all three bands are None/zero and saturation is None/1.0 —
+    caller should treat that as "no filter needed", same as other builders
+    in this module.
+    """
+    lift = lift or (0.0, 0.0, 0.0)
+    gamma = gamma or (0.0, 0.0, 0.0)
+    gain = gain or (0.0, 0.0, 0.0)
+
+    has_balance = any(abs(v) > 1e-6 for band in (lift, gamma, gain) for v in band)
+    has_sat = saturation is not None and abs(saturation - 1.0) > 1e-6
+
+    parts = []
+    if has_balance:
+        rs, gs, bs = lift
+        rm, gm, bm = gamma
+        rh, gh, bh = gain
+        parts.append(
+            "colorbalance="
+            f"rs={rs:.4f}:gs={gs:.4f}:bs={bs:.4f}:"
+            f"rm={rm:.4f}:gm={gm:.4f}:bm={bm:.4f}:"
+            f"rh={rh:.4f}:gh={gh:.4f}:bh={bh:.4f}"
+        )
+    if has_sat:
+        parts.append(f"eq=saturation={saturation:.4f}")
+
+    return ",".join(parts)
+
+
 def apply_grade(input_path: Path, output_path: Path, filter_string: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not filter_string:
@@ -315,6 +390,22 @@ def main() -> None:
         help="Analyze a clip and print the auto-grade filter it would produce. No output written.",
     )
     ap.add_argument(
+        "--lift", type=str, default=None, metavar="R,G,B",
+        help="3-way color balance, shadows RGB offset (e.g. '0.02,0.0,-0.03'). Combine with --gamma/--gain/--sat.",
+    )
+    ap.add_argument(
+        "--gamma", type=str, default=None, metavar="R,G,B",
+        help="3-way color balance, midtones RGB offset.",
+    )
+    ap.add_argument(
+        "--gain", type=str, default=None, metavar="R,G,B",
+        help="3-way color balance, highlights RGB offset.",
+    )
+    ap.add_argument(
+        "--sat", type=float, default=None,
+        help="Overall saturation multiplier for 3-way mode (1.0 = no change). Ignored outside --lift/--gamma/--gain.",
+    )
+    ap.add_argument(
         "--print-preset",
         type=str,
         default=None,
@@ -353,12 +444,18 @@ def main() -> None:
         sys.exit(f"input not found: {args.input}")
 
     # Decide filter string
+    wants_three_way = args.lift or args.gamma or args.gain or args.sat is not None
     if args.filter is not None:
         filter_string = args.filter
+    elif wants_three_way:
+        lift = _parse_rgb_triplet(args.lift, "lift") if args.lift else None
+        gamma = _parse_rgb_triplet(args.gamma, "gamma") if args.gamma else None
+        gain = _parse_rgb_triplet(args.gain, "gain") if args.gain else None
+        filter_string = build_three_way_filter(lift, gamma, gain, args.sat)
     elif args.preset is not None:
         filter_string = get_preset(args.preset)
     else:
-        # Auto mode (default)
+        # Auto mode (default) — untouched by the 3-way addition above
         filter_string, _ = auto_grade_for_clip(args.input, verbose=True)
 
     print(f"grading {args.input.name} → {args.output.name}")
