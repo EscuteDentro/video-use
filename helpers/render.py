@@ -850,10 +850,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--fps",
-        type=parse_fps,
-        default=None,
-        help="Output frame rate. Default: preserve the source's frame rate "
-             "(falls back to 24 if it can't be probed). Pass e.g. --fps 30 or "
+        type=lambda v: None if v.strip().lower() == "source" else parse_fps(v),
+        default="24",
+        help="Output frame rate. Default: 24 (this fork keeps it because downstream "
+             "tools - caption timing, project importer - assume 24). Pass "
+             "--fps source to preserve the source's frame rate, or e.g. --fps 30 / "
              "--fps 30000/1001 to force.",
     )
     args = ap.parse_args()
