@@ -125,7 +125,10 @@ def get_video_stream_duration(path: Path) -> float:
     audio stream. Requesting an EDL range past the video's real length produces
     unpredictable ffmpeg behavior (frozen last frame, early stop) with no error or
     warning - silently corrupts sync for every segment after it. Always clamp
-    against this, never against the container/audio duration alone."""
+    against this, never against the container/audio duration alone.
+
+    Returns infinity (no clamp) when the stream duration can't be read - e.g.
+    containers that report it as N/A (MKV/WebM) or a failed probe."""
     key = str(path)
     if key not in _video_duration_cache:
         out = subprocess.run(
@@ -133,7 +136,11 @@ def get_video_stream_duration(path: Path) -> float:
              "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1", key],
             capture_output=True, text=True,
         )
-        _video_duration_cache[key] = float(out.stdout.strip())
+        try:
+            _video_duration_cache[key] = float(out.stdout.strip())
+        except ValueError:
+            print(f"  WARNING: could not read video stream duration of {path.name} - range end not clamped")
+            _video_duration_cache[key] = float("inf")
     return _video_duration_cache[key]
 
 
