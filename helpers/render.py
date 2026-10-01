@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -90,6 +91,27 @@ def resolve_path(maybe_path: str, base: Path) -> Path:
     if p.is_absolute():
         return p
     return (base / p).resolve()
+
+
+def has_audio_stream(path: Path) -> bool:
+    """Whether the source has an audio stream at all.
+
+    Bug real, verificado 2026-09-13: fonte sem áudio (b-roll silencioso,
+    comum no caso D "inserir cena nova") fazia `extract_segment` emitir um
+    segmento só de vídeo. `concat_segments` usa o demuxer `-c copy`, que não
+    trava nesse caso (sem erro, sem warning) mas herda a duração de áudio do
+    PRIMEIRO segmento pra timeline inteira — testado (2 segmentos de 3s cada,
+    1 com áudio 1 sem): resultado saiu com vídeo de 6s e áudio de só 3.02s,
+    o áudio simplesmente para na metade do vídeo, silenciosamente. Cada fonte
+    agora é checada; sem áudio, `extract_segment` sintetiza silêncio da
+    mesma duração, garantindo que todo segmento tenha os 2 streams com
+    duração igual antes do concat."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    return bool(out.stdout.strip())
 
 
 _video_duration_cache: dict[str, float] = {}
@@ -239,14 +261,6 @@ def extract_segment(
         vf_parts.append(grade_filter)
     vf = ",".join(vf_parts)
 
-    af_parts: list[str] = []
-    if audio_filter:
-        af_parts.append(audio_filter)
-    fade_out_start = max(0.0, duration - fade_out)
-    af_parts.append(f"afade=t=in:st=0:d={fade_in:.3f}")
-    af_parts.append(f"afade=t=out:st={fade_out_start:.3f}:d={fade_out:.3f}")
-    af = ",".join(af_parts)
-
     if draft:
         preset, crf = "ultrafast", "28"
     elif preview:
@@ -254,19 +268,46 @@ def extract_segment(
     else:
         preset, crf = "fast", "20"
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{seg_start:.3f}",
-        "-i", str(source),
-        "-t", f"{duration:.3f}",
-        "-vf", vf,
-        "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-movflags", "+faststart",
-        str(out_path),
-    ]
+    if has_audio_stream(source):
+        af_parts: list[str] = []
+        if audio_filter:
+            af_parts.append(audio_filter)
+        fade_out_start = max(0.0, duration - fade_out)
+        af_parts.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+        af_parts.append(f"afade=t=out:st={fade_out_start:.3f}:d={fade_out:.3f}")
+        af = ",".join(af_parts)
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg_start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-vf", vf,
+            "-af", af,
+            "-c:v", "libx264", "-preset", preset, "-crf", crf,
+            "-pix_fmt", "yuv420p", "-r", "24",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+    else:
+        # Fonte sem trilha de áudio (b-roll silencioso, comum no caso D da
+        # ARQUITETURA) — sintetiza silêncio da mesma duração em vez de deixar
+        # o segmento sair sem áudio, porque o concat demuxer (-c copy) herda a
+        # duração de áudio só do PRIMEIRO segmento (ver has_audio_stream acima).
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg_start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-vf", vf,
+            "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+            "-c:v", "libx264", "-preset", preset, "-crf", crf,
+            "-pix_fmt", "yuv420p", "-r", "24",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -493,6 +534,18 @@ def measure_loudness(video_path: Path) -> dict[str, str] | None:
         return None
     needed = {"input_i", "input_tp", "input_lra", "input_thresh", "target_offset"}
     if not needed.issubset(data.keys()):
+        return None
+    # Real bug found 2026-09-13: um trecho totalmente silencioso (silêncio
+    # digital puro, ex: b-roll sem áudio original + trilha sintetizada,
+    # ver has_audio_stream) mede input_i/target_offset como "-inf"/"inf" —
+    # strings que o `loudnorm` da segunda passada não aceita como parâmetro
+    # numérico, e quebra com exit 222. Tratar como medição inválida (mesmo
+    # caminho de "measurement failed") força o fallback de 1 passada, que
+    # não depende desses valores medidos.
+    try:
+        if not all(math.isfinite(float(data[k])) for k in needed):
+            return None
+    except (TypeError, ValueError):
         return None
     return data
 
